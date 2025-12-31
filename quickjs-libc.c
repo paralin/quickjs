@@ -4543,6 +4543,53 @@ done:
     return JS_HasException(ctx);
 }
 
+#ifdef QJS_WASI_REACTOR
+/*
+ * Run one iteration of the event loop (non-blocking).
+ *
+ * Executes all pending microtasks (promise jobs), then checks timers
+ * and runs at most one expired timer callback.
+ *
+ * Returns:
+ *   > 0: Next timer fires in this many milliseconds; call again after delay
+ *     0: More work pending; call again immediately (via queueMicrotask)
+ *    -1: No pending work; event loop is idle
+ *    -2: An exception occurred; call js_std_dump_error() for details
+ */
+int js_std_loop_once(JSContext *ctx)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSContext *ctx1;
+    int err, min_delay;
+
+    /* execute all pending jobs */
+    for(;;) {
+        err = JS_ExecutePendingJob(rt, &ctx1);
+        if (err < 0)
+            return -2; /* error */
+        if (err == 0)
+            break;
+    }
+
+    /* run at most one expired timer */
+    if (js_os_run_timers(rt, ctx, ts, &min_delay) < 0)
+        return -2; /* error in timer callback */
+
+    /* check if more work is pending */
+    if (JS_IsJobPending(rt))
+        return 0; /* more microtasks pending */
+
+    if (min_delay == 0)
+        return 0; /* timer ready to fire immediately */
+
+    if (min_delay > 0)
+        return min_delay; /* next timer delay in ms */
+
+    return -1; /* idle, no pending work */
+}
+#endif /* QJS_WASI_REACTOR */
+
 /* Wait for a promise and execute pending jobs while waiting for
    it. Return the promise result or JS_EXCEPTION in case of promise
    rejection. */
