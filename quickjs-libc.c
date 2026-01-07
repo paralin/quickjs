@@ -2753,29 +2753,46 @@ done:
 }
 #endif // defined(_WIN32)
 
-#ifdef QJS_WASI_REACTOR
-/*
- * Poll for I/O events and invoke registered read/write handlers.
- * This is specifically for the reactor model where the host controls the
- * event loop and needs to trigger I/O handler callbacks when data is available.
- *
- * Unlike js_os_poll(), this function:
- * - Does NOT run timers (js_std_loop_once handles that)
- * - Uses a caller-specified timeout instead of timer-based min_delay
- * - Returns immediately after invoking one handler (like js_os_poll)
- *
- * Parameters:
- *   ctx: The JavaScript context
- *   timeout_ms: Poll timeout in milliseconds
- *               0 = non-blocking (return immediately)
- *               >0 = wait up to timeout_ms for I/O
- *               -1 = block indefinitely (not recommended for reactor)
- *
- * Returns:
- *   0: Success (handler was invoked or no handlers registered)
- *   -1: Error or no I/O handlers registered
- *   -2: Exception occurred in handler
- */
+#if defined(_WIN32)
+int js_std_poll_io(JSContext *ctx, int timeout_ms)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    int count;
+    JSOSRWHandler *rh;
+    struct list_head *el;
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+
+    /* Check if there are any I/O handlers registered */
+    if (list_empty(&ts->os_rw_handlers))
+        return 0; /* no handlers, nothing to do */
+
+    count = 0;
+    list_for_each(el, &ts->os_rw_handlers) {
+        rh = list_entry(el, JSOSRWHandler, link);
+        if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0]))
+            handles[count++] = (HANDLE)_get_osfhandle(rh->fd);
+        if (count == (int)countof(handles))
+            break;
+    }
+
+    if (count == 0)
+        return 0; /* no active handlers */
+
+    DWORD ret, timeout = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
+    ret = WaitForMultipleObjects(count, handles, FALSE, timeout);
+    if (ret < (DWORD)count) {
+        list_for_each(el, &ts->os_rw_handlers) {
+            rh = list_entry(el, JSOSRWHandler, link);
+            if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
+                int r = call_handler(ctx, rh->rw_func[0]);
+                return (r < 0) ? -2 : 0;
+            }
+        }
+    }
+    return 0;
+}
+#else // !defined(_WIN32)
 int js_std_poll_io(JSContext *ctx, int timeout_ms)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -2839,13 +2856,12 @@ int js_std_poll_io(JSContext *ctx, int timeout_ms)
             }
         }
     }
-
 done:
     if (pfds != pfds_local)
         js_free(ctx, pfds);
     return ret;
 }
-#endif /* QJS_WASI_REACTOR */
+#endif // defined(_WIN32)
 
 static JSValue make_obj_error(JSContext *ctx,
                               JSValue obj,
@@ -4641,19 +4657,6 @@ done:
     return JS_HasException(ctx);
 }
 
-#ifdef QJS_WASI_REACTOR
-/*
- * Run one iteration of the event loop (non-blocking).
- *
- * Executes all pending microtasks (promise jobs), then checks timers
- * and runs at most one expired timer callback.
- *
- * Returns:
- *   > 0: Next timer fires in this many milliseconds; call again after delay
- *     0: More work pending; call again immediately (via queueMicrotask)
- *    -1: No pending work; event loop is idle
- *    -2: An exception occurred; call js_std_dump_error() for details
- */
 int js_std_loop_once(JSContext *ctx)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -4686,7 +4689,6 @@ int js_std_loop_once(JSContext *ctx)
 
     return -1; /* idle, no pending work */
 }
-#endif /* QJS_WASI_REACTOR */
 
 /* Wait for a promise and execute pending jobs while waiting for
    it. Return the promise result or JS_EXCEPTION in case of promise

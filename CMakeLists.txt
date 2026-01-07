@@ -129,7 +129,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
         -lwasi-emulated-process-clocks
         -lwasi-emulated-signal
     )
-    option(QJS_WASI_REACTOR "Build WASI reactor (re-entrant, exports instead of _start)" OFF)
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
@@ -337,32 +336,99 @@ if(NOT WIN32)
     set_target_properties(qjs_exe PROPERTIES ENABLE_EXPORTS TRUE)
 endif()
 
-# WASI Reactor build
+# WASI Reactor
 #
-if(QJS_WASI_REACTOR)
-    add_executable(qjs_wasi_reactor
-        gen/repl.c
-        gen/standalone.c
-        qjs.c
-    )
-    add_qjs_libc_if_needed(qjs_wasi_reactor)
-    set_target_properties(qjs_wasi_reactor PROPERTIES
-        OUTPUT_NAME "qjs"
-        SUFFIX ".wasm"
-    )
-    target_compile_definitions(qjs_wasi_reactor PRIVATE ${qjs_defines} QJS_WASI_REACTOR)
-    target_link_libraries(qjs_wasi_reactor qjs)
-    target_link_options(qjs_wasi_reactor PRIVATE
-        -mexec-model=reactor
-        -Wl,--export=qjs_init
-        -Wl,--export=qjs_init_argv
-        -Wl,--export=qjs_eval
-        -Wl,--export=qjs_loop_once
-        -Wl,--export=qjs_poll_io
-        -Wl,--export=qjs_destroy
-        -Wl,--export=malloc
-        -Wl,--export=free
-    )
+
+if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
+    option(QJS_WASI_REACTOR "Build WASI reactor (exports library functions, no _start)" OFF)
+    if(QJS_WASI_REACTOR)
+        add_executable(qjs_wasi
+            quickjs-libc.c
+        )
+        set_target_properties(qjs_wasi PROPERTIES
+            OUTPUT_NAME "qjs"
+            SUFFIX ".wasm"
+        )
+        target_compile_definitions(qjs_wasi PRIVATE ${qjs_defines})
+        target_link_libraries(qjs_wasi qjs)
+        target_link_options(qjs_wasi PRIVATE
+            -mexec-model=reactor
+            # Memory management
+            -Wl,--export=malloc
+            -Wl,--export=free
+            -Wl,--export=realloc
+            -Wl,--export=calloc
+            # Core runtime (quickjs.h)
+            -Wl,--export=JS_NewRuntime
+            -Wl,--export=JS_FreeRuntime
+            -Wl,--export=JS_NewContext
+            -Wl,--export=JS_FreeContext
+            -Wl,--export=JS_GetRuntime
+            -Wl,--export=JS_SetMemoryLimit
+            -Wl,--export=JS_SetMaxStackSize
+            -Wl,--export=JS_SetGCThreshold
+            -Wl,--export=JS_RunGC
+            # Evaluation
+            -Wl,--export=JS_Eval
+            -Wl,--export=JS_EvalFunction
+            -Wl,--export=JS_Call
+            # Values (note: many JS_Is*/JS_New* are inline, so not exported)
+            -Wl,--export=JS_NewStringLen
+            -Wl,--export=JS_NewObject
+            -Wl,--export=JS_NewArray
+            -Wl,--export=JS_NewArrayBufferCopy
+            -Wl,--export=JS_ToBool
+            -Wl,--export=JS_ToInt32
+            -Wl,--export=JS_ToInt64
+            -Wl,--export=JS_ToFloat64
+            -Wl,--export=JS_ToCStringLen2
+            -Wl,--export=JS_FreeCString
+            -Wl,--export=JS_GetArrayBuffer
+            -Wl,--export=JS_DupValue
+            -Wl,--export=JS_FreeValue
+            # Properties
+            -Wl,--export=JS_GetPropertyStr
+            -Wl,--export=JS_GetPropertyUint32
+            -Wl,--export=JS_SetPropertyStr
+            -Wl,--export=JS_SetPropertyUint32
+            -Wl,--export=JS_HasProperty
+            -Wl,--export=JS_DeleteProperty
+            -Wl,--export=JS_GetGlobalObject
+            # Exceptions
+            -Wl,--export=JS_Throw
+            -Wl,--export=JS_GetException
+            -Wl,--export=JS_HasException
+            -Wl,--export=JS_IsError
+            # Promises
+            -Wl,--export=JS_PromiseState
+            -Wl,--export=JS_PromiseResult
+            # Jobs
+            -Wl,--export=JS_ExecutePendingJob
+            -Wl,--export=JS_IsJobPending
+            # Modules
+            -Wl,--export=JS_SetModuleLoaderFunc
+            -Wl,--export=JS_NewCModule
+            -Wl,--export=JS_AddModuleExport
+            -Wl,--export=JS_SetModuleExport
+            # Standard library (quickjs-libc.h)
+            -Wl,--export=js_init_module_std
+            -Wl,--export=js_init_module_os
+            -Wl,--export=js_init_module_bjson
+            -Wl,--export=js_std_init_handlers
+            -Wl,--export=js_std_free_handlers
+            -Wl,--export=js_std_add_helpers
+            -Wl,--export=js_std_loop
+            -Wl,--export=js_std_loop_once
+            -Wl,--export=js_std_poll_io
+            -Wl,--export=js_std_await
+            -Wl,--export=js_std_dump_error
+            -Wl,--export=js_std_eval_binary
+            -Wl,--export=js_load_file
+            -Wl,--export=js_module_set_import_meta
+            -Wl,--export=js_module_loader
+            -Wl,--export=js_std_promise_rejection_tracker
+        )
+    endif()
 endif()
 
 if(QJS_BUILD_CLI_WITH_MIMALLOC OR QJS_BUILD_CLI_WITH_STATIC_MIMALLOC)
