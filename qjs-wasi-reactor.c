@@ -26,9 +26,9 @@
  * THE SOFTWARE.
  */
 
-/* Include qjs.c to get access to static functions like eval_buf, eval_file,
- * parse_limit, and JS_NewCustomContext */
-#include "qjs.c"
+#include "quickjs.h"
+#include "quickjs-libc.h"
+#include "qjs-common.h"
 
 static JSRuntime *reactor_rt = NULL;
 static JSContext *reactor_ctx = NULL;
@@ -45,134 +45,39 @@ int qjs_init(void)
 __attribute__((export_name("qjs_init_argv")))
 int qjs_init_argv(int argc, char **argv)
 {
+    QJSConfig cfg;
     int optind = 1;
-    char *expr = NULL;
-    int module = -1;
-    int load_std = 0;
-    char *include_list[32];
-    int i, include_count = 0;
-    int64_t memory_limit = -1;
-    int64_t stack_size = -1;
 
     if (reactor_rt)
         return -1; /* already initialized */
 
-    /* Parse options (subset of main()) */
-    while (optind < argc && *argv[optind] == '-') {
-        char *arg = argv[optind] + 1;
-        const char *longopt = "";
-        char *optarg = NULL;
-        if (!*arg)
-            break;
-        optind++;
-        if (*arg == '-') {
-            longopt = arg + 1;
-            optarg = strchr(longopt, '=');
-            if (optarg)
-                *optarg++ = '\0';
-            arg += strlen(arg);
-            if (!*longopt)
-                break;
-        }
-        for (; *arg || *longopt; longopt = "") {
-            char opt = *arg;
-            if (opt) {
-                arg++;
-                if (!optarg && *arg)
-                    optarg = arg;
-            }
-            if (opt == 'e' || !strcmp(longopt, "eval")) {
-                if (!optarg) {
-                    if (optind >= argc)
-                        return -1;
-                    optarg = argv[optind++];
-                }
-                expr = optarg;
-                break;
-            }
-            if (opt == 'I' || !strcmp(longopt, "include")) {
-                if (optind >= argc || include_count >= countof(include_list))
-                    return -1;
-                include_list[include_count++] = argv[optind++];
-                continue;
-            }
-            if (opt == 'm' || !strcmp(longopt, "module")) {
-                module = 1;
-                continue;
-            }
-            if (!strcmp(longopt, "std")) {
-                load_std = 1;
-                continue;
-            }
-            if (!strcmp(longopt, "memory-limit")) {
-                if (!optarg) {
-                    if (optind >= argc)
-                        return -1;
-                    optarg = argv[optind++];
-                }
-                memory_limit = parse_limit(optarg);
-                break;
-            }
-            if (!strcmp(longopt, "stack-size")) {
-                if (!optarg) {
-                    if (optind >= argc)
-                        return -1;
-                    optarg = argv[optind++];
-                }
-                stack_size = parse_limit(optarg);
-                break;
-            }
-            break; /* ignore unknown options */
-        }
-    }
+    qjs_config_init(&cfg);
+    if (qjs_config_parse_args(&cfg, argc, argv, &optind) < 0)
+        return -1;
+
+    qjs_set_argv(argc, argv);
 
     reactor_rt = JS_NewRuntime();
     if (!reactor_rt)
         return -1;
-    if (memory_limit >= 0)
-        JS_SetMemoryLimit(reactor_rt, (size_t)memory_limit);
-    if (stack_size >= 0)
-        JS_SetMaxStackSize(reactor_rt, (size_t)stack_size);
 
-    js_std_set_worker_new_context_func(JS_NewCustomContext);
-    js_std_init_handlers(reactor_rt);
+    if (cfg.memory_limit >= 0)
+        JS_SetMemoryLimit(reactor_rt, (size_t)cfg.memory_limit);
+    if (cfg.stack_size >= 0)
+        JS_SetMaxStackSize(reactor_rt, (size_t)cfg.stack_size);
 
-    reactor_ctx = JS_NewCustomContext(reactor_rt);
-    if (!reactor_ctx) {
-        js_std_free_handlers(reactor_rt);
-        JS_FreeRuntime(reactor_rt);
-        reactor_rt = NULL;
-        return -1;
-    }
+    qjs_setup_runtime(reactor_rt);
 
-    JS_SetModuleLoaderFunc2(reactor_rt, NULL, js_module_loader,
-                            js_module_check_attributes, NULL);
-    JS_SetHostPromiseRejectionTracker(reactor_rt, js_std_promise_rejection_tracker, NULL);
-    js_std_add_helpers(reactor_ctx, argc - optind, argv + optind);
+    reactor_ctx = qjs_new_context(reactor_rt);
+    if (!reactor_ctx)
+        goto fail;
 
-    if (load_std) {
-        const char *str =
-            "import * as bjson from 'qjs:bjson';\n"
-            "import * as std from 'qjs:std';\n"
-            "import * as os from 'qjs:os';\n"
-            "globalThis.bjson = bjson;\n"
-            "globalThis.std = std;\n"
-            "globalThis.os = os;\n";
-        if (eval_buf(reactor_ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE))
-            goto fail;
-    }
+    if (qjs_apply_config(reactor_ctx, &cfg, argc - optind, argv + optind) < 0)
+        goto fail;
 
-    for (i = 0; i < include_count; i++) {
-        if (eval_file(reactor_ctx, include_list[i], 0))
-            goto fail;
-    }
-
-    if (expr) {
-        if (eval_buf(reactor_ctx, expr, strlen(expr), "<cmdline>",
-                     module == 1 ? JS_EVAL_TYPE_MODULE : 0))
-            goto fail;
-    } else if (optind < argc) {
-        if (eval_file(reactor_ctx, argv[optind], module))
+    /* Evaluate file argument if present */
+    if (optind < argc) {
+        if (qjs_eval_file(reactor_ctx, argv[optind], cfg.module))
             goto fail;
     }
 
@@ -180,10 +85,12 @@ int qjs_init_argv(int argc, char **argv)
 
 fail:
     js_std_free_handlers(reactor_rt);
-    JS_FreeContext(reactor_ctx);
+    if (reactor_ctx) {
+        JS_FreeContext(reactor_ctx);
+        reactor_ctx = NULL;
+    }
     JS_FreeRuntime(reactor_rt);
     reactor_rt = NULL;
-    reactor_ctx = NULL;
     return -1;
 }
 
