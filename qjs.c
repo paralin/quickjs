@@ -35,6 +35,7 @@
 #include "cutils.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
+#include "qjs-common.h"
 
 #ifdef QJS_USE_MIMALLOC
 #include <mimalloc.h>
@@ -42,6 +43,10 @@
 
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
+static int qjs__argc;
+static char **qjs__argv;
+
+#ifndef QJS_NO_MAIN
 extern const uint8_t qjsc_standalone[];
 extern const uint32_t qjsc_standalone_size;
 
@@ -50,10 +55,6 @@ extern const uint32_t qjsc_standalone_size;
 static const char trailer_magic[] = "quickjs2";
 static const int trailer_magic_size = sizeof(trailer_magic) - 1;
 static const int trailer_size = TRAILER_SIZE;
-
-static int qjs__argc;
-static char **qjs__argv;
-
 
 static bool is_standalone(const char *exe)
 {
@@ -103,9 +104,10 @@ static JSValue load_standalone_module(JSContext *ctx)
     JS_FreeValue(ctx, obj);
     return JS_GetModuleNamespace(ctx, m);
 }
+#endif /* !QJS_NO_MAIN */
 
-static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
-                    const char *filename, int eval_flags)
+int qjs_eval_buf(JSContext *ctx, const void *buf, int buf_len,
+                 const char *filename, int eval_flags)
 {
     bool use_realpath;
     JSValue val;
@@ -142,7 +144,7 @@ end:
     return ret;
 }
 
-static int eval_file(JSContext *ctx, const char *filename, int module)
+int qjs_eval_file(JSContext *ctx, const char *filename, int module)
 {
     uint8_t *buf;
     int ret, eval_flags;
@@ -162,12 +164,12 @@ static int eval_file(JSContext *ctx, const char *filename, int module)
         eval_flags = JS_EVAL_TYPE_MODULE;
     else
         eval_flags = JS_EVAL_TYPE_GLOBAL;
-    ret = eval_buf(ctx, buf, buf_len, filename, eval_flags);
+    ret = qjs_eval_buf(ctx, buf, buf_len, filename, eval_flags);
     js_free(ctx, buf);
     return ret;
 }
 
-static int64_t parse_limit(const char *arg) {
+int64_t qjs_parse_limit(const char *arg) {
     char *p;
     unsigned long unit = 1024; /* default to traditional KB */
     double d = strtod(arg, &p);
@@ -196,6 +198,136 @@ static int64_t parse_limit(const char *arg) {
     return (int64_t)(d * unit);
 }
 
+void qjs_config_init(QJSConfig *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->module = -1;
+    cfg->memory_limit = -1;
+    cfg->stack_size = -1;
+}
+
+int qjs_config_parse_args(QJSConfig *cfg, int argc, char **argv, int *poptind)
+{
+    int optind = *poptind;
+
+    while (optind < argc && *argv[optind] == '-') {
+        char *arg = argv[optind] + 1;
+        const char *longopt = "";
+        char *optarg = NULL;
+        if (!*arg)
+            break;
+        optind++;
+        if (*arg == '-') {
+            longopt = arg + 1;
+            optarg = strchr(longopt, '=');
+            if (optarg)
+                *optarg++ = '\0';
+            arg += strlen(arg);
+            if (!*longopt)
+                break;
+        }
+        for (; *arg || *longopt; longopt = "") {
+            char opt = *arg;
+            if (opt) {
+                arg++;
+                if (!optarg && *arg)
+                    optarg = arg;
+            }
+            if (opt == 'e' || !strcmp(longopt, "eval")) {
+                if (!optarg) {
+                    if (optind >= argc)
+                        return -1;
+                    optarg = argv[optind++];
+                }
+                cfg->expr = optarg;
+                break;
+            }
+            if (opt == 'I' || !strcmp(longopt, "include")) {
+                if (optind >= argc || cfg->include_count >= QJS_INCLUDE_MAX)
+                    return -1;
+                cfg->include_list[cfg->include_count++] = argv[optind++];
+                continue;
+            }
+            if (opt == 'm' || !strcmp(longopt, "module")) {
+                cfg->module = 1;
+                continue;
+            }
+            if (!strcmp(longopt, "std")) {
+                cfg->load_std = 1;
+                continue;
+            }
+            if (!strcmp(longopt, "memory-limit")) {
+                if (!optarg) {
+                    if (optind >= argc)
+                        return -1;
+                    optarg = argv[optind++];
+                }
+                cfg->memory_limit = qjs_parse_limit(optarg);
+                break;
+            }
+            if (!strcmp(longopt, "stack-size")) {
+                if (!optarg) {
+                    if (optind >= argc)
+                        return -1;
+                    optarg = argv[optind++];
+                }
+                cfg->stack_size = qjs_parse_limit(optarg);
+                break;
+            }
+            break; /* ignore unknown options */
+        }
+    }
+
+    *poptind = optind;
+    return 0;
+}
+
+void qjs_set_argv(int argc, char **argv)
+{
+    qjs__argc = argc;
+    qjs__argv = argv;
+}
+
+void qjs_setup_runtime(JSRuntime *rt)
+{
+    js_std_set_worker_new_context_func(qjs_new_context);
+    js_std_init_handlers(rt);
+    JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);
+    JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker, NULL);
+}
+
+int qjs_apply_config(JSContext *ctx, const QJSConfig *cfg, int argc, char **argv)
+{
+    int i;
+
+    js_std_add_helpers(ctx, argc, argv);
+
+    if (cfg->load_std) {
+        const char *str =
+            "import * as bjson from 'qjs:bjson';\n"
+            "import * as std from 'qjs:std';\n"
+            "import * as os from 'qjs:os';\n"
+            "globalThis.bjson = bjson;\n"
+            "globalThis.std = std;\n"
+            "globalThis.os = os;\n";
+        if (qjs_eval_buf(ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE))
+            return -1;
+    }
+
+    for (i = 0; i < cfg->include_count; i++) {
+        if (qjs_eval_file(ctx, cfg->include_list[i], 0))
+            return -1;
+    }
+
+    if (cfg->expr) {
+        int flags = cfg->module == 1 ? JS_EVAL_TYPE_MODULE : 0;
+        if (qjs_eval_buf(ctx, cfg->expr, strlen(cfg->expr), "<cmdline>", flags))
+            return -1;
+    }
+
+    return 0;
+}
+
 static JSValue js_gc(JSContext *ctx, JSValueConst this_val,
                      int argc, JSValueConst *argv)
 {
@@ -220,7 +352,7 @@ static const JSCFunctionListEntry global_obj[] = {
 };
 
 /* also used to initialize the worker context */
-static JSContext *JS_NewCustomContext(JSRuntime *rt)
+JSContext *qjs_new_context(JSRuntime *rt)
 {
     JSContext *ctx;
     ctx = JS_NewContext(rt);
@@ -250,6 +382,7 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     return ctx;
 }
 
+#ifndef QJS_NO_MAIN
 struct trace_malloc_data {
     uint8_t *base;
 };
@@ -337,6 +470,7 @@ static const JSMallocFunctions trace_mf = {
     js_trace_realloc,
     js__malloc_usable_size
 };
+#endif /* !QJS_NO_MAIN */
 
 #ifdef QJS_USE_MIMALLOC
 static void *js_mi_calloc(void *opaque, size_t count, size_t size)
@@ -395,6 +529,7 @@ void help(void)
     exit(1);
 }
 
+#ifndef QJS_NO_MAIN
 int main(int argc, char **argv)
 {
     JSRuntime *rt;
@@ -531,7 +666,7 @@ int main(int argc, char **argv)
                     }
                     optarg = argv[optind++];
                 }
-                memory_limit = parse_limit(optarg);
+                memory_limit = qjs_parse_limit(optarg);
                 break;
             }
             if (!strcmp(longopt, "stack-size")) {
@@ -542,7 +677,7 @@ int main(int argc, char **argv)
                     }
                     optarg = argv[optind++];
                 }
-                stack_size = parse_limit(optarg);
+                stack_size = qjs_parse_limit(optarg);
                 break;
             }
             if (opt == 'c' || !strcmp(longopt, "compile")) {
@@ -612,9 +747,9 @@ start:
         JS_SetMaxStackSize(rt, (size_t)stack_size);
     if (dump_flags != 0)
         JS_SetDumpFlags(rt, dump_flags);
-    js_std_set_worker_new_context_func(JS_NewCustomContext);
+    js_std_set_worker_new_context_func(qjs_new_context);
     js_std_init_handlers(rt);
-    ctx = JS_NewCustomContext(rt);
+    ctx = qjs_new_context(rt);
     if (!ctx) {
         fprintf(stderr, "qjs: cannot allocate JS context\n");
         exit(2);
@@ -638,11 +773,11 @@ start:
                 "globalThis.bjson = bjson;\n"
                 "globalThis.std = std;\n"
                 "globalThis.os = os;\n";
-            eval_buf(ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE);
+            qjs_eval_buf(ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE);
         }
 
         for(i = 0; i < include_count; i++) {
-            if (eval_file(ctx, include_list[i], 0))
+            if (qjs_eval_file(ctx, include_list[i], 0))
                 goto fail;
         }
 
@@ -675,7 +810,7 @@ start:
             JS_FreeValue(ctx, args[2]);
         } else if (expr) {
             int flags = module ? JS_EVAL_TYPE_MODULE : 0;
-            if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", flags))
+            if (qjs_eval_buf(ctx, expr, strlen(expr), "<cmdline>", flags))
                 goto fail;
         } else if (optind >= argc) {
             /* interactive mode */
@@ -683,7 +818,7 @@ start:
         } else {
             const char *filename;
             filename = argv[optind];
-            if (eval_file(ctx, filename, module))
+            if (qjs_eval_file(ctx, filename, module))
                 goto fail;
         }
         if (interactive) {
@@ -746,3 +881,4 @@ start:
     JS_FreeRuntime(rt);
     return 1;
 }
+#endif /* QJS_NO_MAIN */
