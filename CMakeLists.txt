@@ -344,12 +344,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
     if(QJS_WASI_REACTOR)
         add_executable(qjs_wasi
             quickjs-libc.c
+            qjs.c
         )
         set_target_properties(qjs_wasi PROPERTIES
             OUTPUT_NAME "qjs"
             SUFFIX ".wasm"
         )
-        target_compile_definitions(qjs_wasi PRIVATE ${qjs_defines})
+        target_compile_definitions(qjs_wasi PRIVATE ${qjs_defines} QJS_WASI_REACTOR)
         target_link_libraries(qjs_wasi qjs)
         target_link_options(qjs_wasi PRIVATE
             -mexec-model=reactor
